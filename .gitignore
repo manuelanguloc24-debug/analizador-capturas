@@ -1,0 +1,5 @@
+git init -b main
+git add .
+git commit -m "feat: MVP 0.4 analizador capturas con metricas y catalogo"
+git remote add origin https://github.com/manuelanguloc24-debug/analizador-capturas.git
+git push -u origin main
