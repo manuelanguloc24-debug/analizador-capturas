@@ -53,13 +53,12 @@ def secret(name: str) -> str:
     try:
         value = st.secrets.get(name)
         if value:
-            return str(value)
+            return str(value).strip()
     except (FileNotFoundError, KeyError, AttributeError):
         pass
-    return os.environ.get(name, "")
+    return os.environ.get(name, "").strip()
 
 
-@st.cache_resource(show_spinner=False)
 def cloud_client(url: str, key: str) -> CloudStore:
     return CloudStore(url, key)
 
@@ -118,7 +117,7 @@ if cloud_configured:
     try:
         store = cloud_client(url, service_key)
     except Exception as exc:
-        st.error(f"No fue posible iniciar Supabase: {type(exc).__name__}")
+        st.error(f"No fue posible iniciar Supabase: {type(exc).__name__}: {exc}")
         st.stop()
 else:
     store = None
@@ -268,7 +267,12 @@ with upload_tab:
                 raw = uploaded.getvalue()
                 sha = hashlib.sha256(raw).hexdigest()
                 date_str = activity_date.isoformat()
-                repeated = sha in scanned or duplicates_in_date(sha, date_str)
+                try:
+                    repeated = sha in scanned or duplicates_in_date(sha, date_str)
+                except Exception as db_exc:
+                    failures.append(f"{uploaded.name} (Error consultando BD): {db_exc}")
+                    bar.progress((idx + 1) / len(files), text=f"Procesando {idx + 1}/{len(files)}")
+                    continue
                 scanned.add(sha)
                 analyzed: dict[str, Any] = {
                     "status": "error",
@@ -308,7 +312,6 @@ with upload_tab:
                     "ocr_selected": analyzed.get("selected"),
                     "ocr_size": analyzed.get("size"),
                 }
-                # Usamos preview_bytes (JPEG optimizado) para ahorrar espacio en Supabase durante los 60 días
                 optimized_bytes = analyzed.get("preview_bytes", raw)
                 mime = "image/jpeg" if "preview_bytes" in analyzed else (
                     {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp"}
@@ -326,10 +329,10 @@ with upload_tab:
                 bar.progress((idx + 1) / len(files), text=f"Procesando {idx + 1}/{len(files)}")
             st.success(f"Registros guardados: {ok} · duplicados detectados: {duplicate_count}")
             if failures:
-                st.error(f"No se guardaron {len(failures)} archivos. No cierres esta pantalla sin revisar errores.")
-                with st.expander("Errores de almacenamiento"):
+                st.error(f"No se guardaron {len(failures)} archivos. Abre el detalle abajo para ver la causa exacta:")
+                with st.expander("Ver detalle del error de Supabase", expanded=True):
                     for err in failures:
-                        st.write(err)
+                        st.code(err)
             st.caption("Los resultados aparecen al abrir 'Revisar resultados' y 'Historial'.")
 
 with result_tab:
