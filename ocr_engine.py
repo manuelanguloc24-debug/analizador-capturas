@@ -13,13 +13,12 @@ from typing import Any
 import pytesseract
 from PIL import Image, ImageOps, UnidentifiedImageError
 
-# Admite 6:00, 06:00, 6:00 a. m., 11:00a.m., 6:00 PM y 18:00.
 TIME_REGEX = re.compile(
     r"(?<![\d:])(?P<hour>\d{1,2})\s*:\s*(?P<minute>[0-5]\d)"
     r"(?:\s*(?P<ampm>[aApP])\s*\.?\s*[mM]\s*\.?)?(?!\d)"
 )
 
-MAX_DIMENSION = 1600  # Límite para acelerar OCR y cuidar la RAM sin perder nitidez
+MAX_DIMENSION = 1600
 
 
 @dataclass
@@ -37,7 +36,6 @@ class TimeCandidate:
 
 
 def parse_clock(text: str) -> tuple[str, bool] | None:
-    """Retorna hora HH:MM en formato 24h, conservando incertidumbre AM/PM."""
     match = TIME_REGEX.search(text)
     if not match:
         return None
@@ -54,19 +52,16 @@ def parse_clock(text: str) -> tuple[str, bool] | None:
 
 
 def preprocess_for_ocr(image: Image.Image) -> Image.Image:
-    """Convierte a escala de grises, detecta modo oscuro y mejora el contraste."""
     gray = ImageOps.grayscale(image)
     hist = gray.histogram()
     dark_pixels = sum(hist[:128])
     light_pixels = sum(hist[128:])
-    # Si predominan los píxeles oscuros (Modo Oscuro), invertir ayuda a Tesseract
     if dark_pixels > light_pixels * 1.4:
         gray = ImageOps.invert(gray)
     return ImageOps.autocontrast(gray, cutoff=1)
 
 
 def collect_candidates(data: dict[str, Any], width: int, height: int) -> list[TimeCandidate]:
-    """Reconstruye líneas OCR y busca horarios con sus coordenadas."""
     lines: dict[tuple[int, int, int], list[dict[str, Any]]] = {}
     for i, token in enumerate(data["text"]):
         if not token or not token.strip():
@@ -88,7 +83,6 @@ def collect_candidates(data: dict[str, Any], width: int, height: int) -> list[Ti
             parsed = parse_clock(m.group())
             if parsed is None:
                 continue
-            # Mapear caracteres de texto reconstruido a los tokens que los contienen.
             starts: list[tuple[int, int, dict[str, Any]]] = []
             offset = 0
             for token in tokens:
@@ -129,13 +123,11 @@ def analyze_image(image_bytes: bytes) -> dict[str, Any]:
     if orig_w * orig_h > 24_000_000:
         raise ValueError("La imagen supera el tamaño máximo permitido (24 megapíxeles).")
 
-    # Redimensionar si es muy grande para acelerar OCR y ahorrar RAM en sesión
     if max(orig_w, orig_h) > MAX_DIMENSION:
         image.thumbnail((MAX_DIMENSION, MAX_DIMENSION), Image.Resampling.LANCZOS)
 
     width, height = image.size
 
-    # Guardar versión comprimida para la vista previa de Streamlit (alineada con las coordenadas)
     preview_buf = io.BytesIO()
     image.save(preview_buf, format="JPEG", quality=80)
     preview_bytes = preview_buf.getvalue()
@@ -152,7 +144,6 @@ def analyze_image(image_bytes: bytes) -> dict[str, Any]:
                 timeout=22,
             )
         except pytesseract.TesseractError:
-            # Fallback automático si el idioma 'spa' no está instalado en la máquina local
             data = pytesseract.image_to_data(
                 processed_img,
                 config="--psm 11",
@@ -165,8 +156,6 @@ def analyze_image(image_bytes: bytes) -> dict[str, Any]:
         raise RuntimeError("El motor OCR no pudo terminar el análisis a tiempo.") from exc
 
     candidates = collect_candidates(data, width, height)
-    # El área superior (12%) suele contener la hora del teléfono.
-    # La parte inferior (último 3.5%) acostumbra a ser la barra para redactar.
     plausible = [c for c in candidates if 0.12 <= c.relative_y <= 0.965]
     if not plausible:
         return {
@@ -179,7 +168,6 @@ def analyze_image(image_bytes: bytes) -> dict[str, Any]:
             "preview_bytes": preview_bytes,
         }
 
-    # Regla del proyecto: seleccionar el último horario VISUALMENTE (más abajo en Y, y más a la derecha en X)
     selected = max(plausible, key=lambda c: (c.y + c.height, c.x))
 
     review_reasons: list[str] = []

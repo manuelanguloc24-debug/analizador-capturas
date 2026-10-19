@@ -1,585 +1,532 @@
-"""Prototipo Streamlit para revisar marcas horarias en capturas de WhatsApp.
+"""Analizador de capturas de WhatsApp · MVP 0.5.
 
-La hora propuesta es la del último mensaje visualmente, no el tiempo EXIF,
-la fecha del archivo, ni la hora de carga. Incluye catálogo territorial completo,
-cálculo de puntualidad y edición directa en tabla.
+Funciones: OCR último horario visible; 06:00 hora de referencia fija;
+navegación por los 14 departamentos; eliminación de duplicados; historial
+permanente en Supabase y retención de imágenes por 60 días.
 """
 from __future__ import annotations
 
 import hashlib
+import hmac
 import io
-import re
-from datetime import date, time
+import os
+from datetime import date, timedelta
 from typing import Any
+from uuid import uuid4
 
 import pandas as pd
 import streamlit as st
 from PIL import Image, ImageDraw, ImageOps
 
+from cloud_store import CloudStore
 from ocr_engine import analyze_image
+from rules import DEPARTAMENTOS, HORA_INICIO_TEXTO, evaluate_punctuality, is_valid_hhmm
 
 st.set_page_config(
-    page_title="Analizador de capturas | MVP 0.4",
+    page_title="Analizador de capturas | MVP 0.5",
     page_icon="🕒",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# Catálogo territorial completo de El Salvador (14 Departamentos -> 44 Municipios -> 262 Distritos)
-TERRITORIO_SV: dict[str, dict[str, list[str]]] = {
-    "Ahuachapán": {
-        "Ahuachapán Norte": ["Atiquizaya", "El Refugio", "San Lorenzo", "Turín"],
-        "Ahuachapán Centro": ["Ahuachapán", "Apaneca", "Concepción de Ataco", "Tacuba"],
-        "Ahuachapán Sur": ["Guaymango", "Jujutla", "San Francisco Menéndez", "San Pedro Puxtla"],
-    },
-    "Cabañas": {
-        "Cabañas Este": ["Dolores", "Guacotecti", "San Isidro", "Sensuntepeque", "Victoria"],
-        "Cabañas Oeste": ["Cinquera", "Ilobasco", "Jutiapa", "Tejutepeque"],
-    },
-    "Chalatenango": {
-        "Chalatenango Norte": ["Citalá", "La Palma", "San Ignacio"],
-        "Chalatenango Centro": [
-            "Agua Caliente", "Dulce Nombre de María", "El Paraíso", "La Reina",
-            "Nueva Concepción", "San Fernando", "San Francisco Morazán",
-            "San Rafael", "Santa Rita", "Tejutla",
-        ],
-        "Chalatenango Sur": [
-            "Arcatao", "Azacualpa", "Cancasque", "Chalatenango", "Comalapa",
-            "Concepción Quezaltepeque", "El Carrizal", "La Laguna", "Las Vueltas",
-            "Nombre de Jesús", "Nueva Trinidad", "Ojos de Agua", "Potonico",
-            "San Antonio de la Cruz", "San Antonio Los Ranchos", "San Francisco Lempa",
-            "San Isidro Labrador", "San José Las Flores", "San Luis del Carmen",
-            "San Miguel de Mercedes",
-        ],
-    },
-    "Cuscatlán": {
-        "Cuscatlán Norte": [
-            "Oratorio de Concepción", "San Bartolomé Perulapía",
-            "San José Guayabal", "San Pedro Perulapán", "Suchitoto",
-        ],
-        "Cuscatlán Sur": [
-            "Candelaria", "Cojutepeque", "El Carmen", "El Rosario",
-            "Monte San Juan", "San Cristóbal", "San Rafael Cedros",
-            "San Ramón", "Santa Cruz Analquito", "Santa Cruz Michapa", "Tenancingo",
-        ],
-    },
-    "La Libertad": {
-        "La Libertad Norte": ["Quezaltepeque", "San Matías", "San Pablo Tacachico"],
-        "La Libertad Centro": ["Ciudad Arce", "San Juan Opico"],
-        "La Libertad Oeste": ["Colón", "Jayaque", "Sacacoyo", "Talnique", "Tepecoyo"],
-        "La Libertad Este": [
-            "Antiguo Cuscatlán", "Huizúcar", "Nuevo Cuscatlán",
-            "San José Villanueva", "Zaragoza",
-        ],
-        "La Libertad Costa": ["Chiltiupán", "Jicalapa", "La Libertad", "Tamanique", "Teotepeque"],
-        "La Libertad Sur": ["Comasagua", "Santa Tecla"],
-    },
-    "La Paz": {
-        "La Paz Oeste": [
-            "Cuyultitán", "Olocuilta", "San Francisco Chinameca",
-            "San Juan Talpa", "San Luis Talpa", "San Pedro Masahuat", "Tapalhuaca",
-        ],
-        "La Paz Centro": [
-            "El Rosario", "Jerusalén", "Mercedes La Ceiba", "Paraíso de Osorio",
-            "San Antonio Masahuat", "San Emigdio", "San Juan Tepezontes",
-            "San Luis La Herradura", "San Miguel Tepezontes", "San Pedro Nonualco",
-            "Santa María Ostuma", "Santiago Nonualco",
-        ],
-        "La Paz Este": ["San Juan Nonualco", "San Rafael Obrajuelo", "Zacatecoluca"],
-    },
-    "La Unión": {
-        "La Unión Norte": [
-            "Anamorós", "Bolívar", "Concepción de Oriente", "El Sauce", "Lislique",
-            "Nueva Esparta", "Pasaquina", "Polorós", "San José", "Santa Rosa de Lima",
-        ],
-        "La Unión Sur": [
-            "Conchagua", "El Carmen", "Intipucá", "La Unión",
-            "Meanguera del Golfo", "San Alejo", "Yayantique", "Yucuaiquín",
-        ],
-    },
-    "Morazán": {
-        "Morazán Norte": [
-            "Arambala", "Cacaopera", "Corinto", "El Rosario", "Joateca",
-            "Jocoaitique", "Meanguera", "Perquín", "San Fernando",
-            "San Isidro", "Torola",
-        ],
-        "Morazán Sur": [
-            "Chilanga", "Delicias de Concepción", "El Divisadero", "Gualococti",
-            "Guatajiagua", "Jocoro", "Lolotiquillo", "Osicala", "San Carlos",
-            "San Francisco Gotera", "San Simón", "Sensembra", "Sociedad",
-            "Yamabal", "Yoloaiquín",
-        ],
-    },
-    "San Miguel": {
-        "San Miguel Norte": [
-            "Carolina", "Chapeltique", "Ciudad Barrios", "Nuevo Edén de San Juan",
-            "San Antonio", "San Gerardo", "San Luis de la Reina", "Sesori",
-        ],
-        "San Miguel Centro": [
-            "Chirilagua", "Comacarán", "Moncagua", "Quelepa", "San Miguel", "Uluazapa",
-        ],
-        "San Miguel Oeste": [
-            "Chinameca", "El Tránsito", "Lolotique", "Nueva Guadalupe",
-            "San Jorge", "San Rafael Oriente",
-        ],
-    },
-    "San Salvador": {
-        "San Salvador Norte": ["Aguilares", "El Paisnal", "Guazapa"],
-        "San Salvador Oeste": ["Apopa", "Nejapa"],
-        "San Salvador Este": ["Ilopango", "San Martín", "Soyapango", "Tonacatepeque"],
-        "San Salvador Centro": [
-            "Ayutuxtepeque", "Cuscatancingo", "Delgado", "Mejicanos", "San Salvador",
-        ],
-        "San Salvador Sur": [
-            "Panchimalco", "Rosario de Mora", "San Marcos", "Santiago Texacuangos", "Santo Tomás",
-        ],
-    },
-    "San Vicente": {
-        "San Vicente Norte": [
-            "Apastepeque", "Santa Clara", "San Esteban Catarina", "San Ildefonso",
-            "San Lorenzo", "San Sebastián", "Santo Domingo",
-        ],
-        "San Vicente Sur": [
-            "Guadalupe", "San Cayetano Istepeque", "San Vicente",
-            "Tecoluca", "Tepetitán", "Verapaz",
-        ],
-    },
-    "Santa Ana": {
-        "Santa Ana Norte": ["Masahuat", "Metapán", "Santa Rosa Guachipilín", "Texistepeque"],
-        "Santa Ana Centro": ["Santa Ana"],
-        "Santa Ana Este": ["Coatepeque", "El Congo"],
-        "Santa Ana Oeste": [
-            "Candelaria de la Frontera", "Chalchuapa", "El Porvenir",
-            "San Antonio Pajonal", "San Sebastián Salitrillo", "Santiago de la Frontera",
-        ],
-    },
-    "Sonsonate": {
-        "Sonsonate Norte": ["Juayúa", "Nahuizalco", "Salcoatitán", "Santa Catarina Masahuat"],
-        "Sonsonate Centro": [
-            "Nahulingo", "San Antonio del Monte", "Santo Domingo de Guzmán",
-            "Sonsonate", "Sonzacate",
-        ],
-        "Sonsonate Este": [
-            "Armenia", "Caluco", "Cuisnahuat", "Izalco", "San Julián", "Santa Isabel Ishuatán",
-        ],
-        "Sonsonate Oeste": ["Acajutla"],
-    },
-    "Usulután": {
-        "Usulután Norte": [
-            "Alegría", "Berlín", "El Triunfo", "Estanzuelas", "Jucuapa",
-            "Mercedes Umaña", "Nueva Granada", "San Buenaventura", "Santiago de María",
-        ],
-        "Usulután Este": [
-            "California", "Concepción Batres", "Ereguayquín", "Jucuarán",
-            "Ozatlán", "San Dionisio", "Santa Elena", "Santa María", "Tecapán", "Usulután",
-        ],
-        "Usulután Oeste": ["Jiquilisco", "Puerto El Triunfo", "San Agustín", "San Francisco Javier"],
-    },
-}
-
-DEPARTAMENTOS = list(TERRITORIO_SV.keys())
-
-COLUMNS = [
-    "id", "fecha_actividad", "departamento", "municipio", "distrito",
-    "archivo", "hora_ocr", "hora_final", "hora_meta", "diferencia_min",
-    "cumplimiento", "estado", "observaciones", "hash_corto",
+ESTADOS = ["detectada", "corregida", "revision", "sin_hora", "duplicada", "error"]
+TABLE_COLUMNS = [
+    "id", "fecha_actividad", "departamento", "archivo", "hora_ocr",
+    "hora_final", "hora_meta", "diferencia_min", "cumplimiento",
+    "estado", "observaciones", "hash_sha256",
+]
+DISPLAY_COLUMNS = [
+    "id", "fecha_actividad", "departamento", "archivo", "hora_ocr",
+    "hora_final", "diferencia_min", "cumplimiento", "estado", "observaciones",
 ]
 
 st.markdown("""
 <style>
-.block-container {padding-top: 1.5rem; padding-bottom: 2rem;}
-div[data-testid="stMetric"] {background: var(--secondary-background-color); padding: 14px; border-radius: 11px;}
+.block-container { padding-top: 1.4rem; padding-bottom: 2rem; }
+div[data-testid="stMetric"] { background: var(--secondary-background-color); padding: 12px; border-radius: 10px; }
 </style>
 """, unsafe_allow_html=True)
 
-if "registros" not in st.session_state:
-    st.session_state.registros = []
+
+def secret(name: str) -> str:
+    """Leer secrets de Streamlit Cloud o variable de entorno local."""
+    try:
+        value = st.secrets.get(name)
+        if value:
+            return str(value)
+    except (FileNotFoundError, KeyError, AttributeError):
+        pass
+    return os.environ.get(name, "")
 
 
-def is_valid_hhmm(val: str) -> bool:
-    return bool(re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", val.strip()))
+@st.cache_resource(show_spinner=False)
+def cloud_client(url: str, key: str) -> CloudStore:
+    return CloudStore(url, key)
 
 
-def evaluate_punctuality(
-    hora_str: str,
-    use_cutoff: bool,
-    cutoff_time: time,
-    tolerance_min: int,
-) -> tuple[str, int | None, str]:
-    if not use_cutoff:
-        return "", None, "No aplica"
-    meta_str = cutoff_time.strftime("%H:%M")
-    if not hora_str or not is_valid_hhmm(hora_str):
-        return meta_str, None, "Pendiente"
-    h, m = map(int, hora_str.strip().split(":"))
-    msg_minutes = h * 60 + m
-    cutoff_minutes = cutoff_time.hour * 60 + cutoff_time.minute
-    diff = msg_minutes - cutoff_minutes
-    if diff < 0:
-        return meta_str, diff, "Antes de inicio"
-    if diff <= tolerance_min:
-        return meta_str, diff, "En tiempo"
-    return meta_str, diff, "Tardía"
-
-
-def table_rows() -> list[dict[str, Any]]:
-    return [{k: item.get(k, "") for k in COLUMNS} for item in st.session_state.registros]
-
-
-def export_csv() -> bytes:
-    frame = pd.DataFrame(table_rows(), columns=COLUMNS)
-    return frame.to_csv(index=False).encode("utf-8-sig")
-
-
-def annotated_preview(data: bytes, selected: dict[str, Any] | None) -> Image.Image:
-    img = ImageOps.exif_transpose(Image.open(io.BytesIO(data))).convert("RGB")
-    if selected:
-        x, y = selected["x"], selected["y"]
-        w, h = selected["width"], selected["height"]
+def safe_image_preview(
+    raw: bytes,
+    selection: dict[str, Any] | None,
+    ocr_size: dict[str, int] | None = None,
+) -> Image.Image:
+    img = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
+    if selection and ocr_size:
+        img = img.resize((int(ocr_size["width"]), int(ocr_size["height"])))
+    if selection:
+        x, y = selection["x"], selection["y"]
+        w, h = selection["width"], selection["height"]
         drawer = ImageDraw.Draw(img)
-        drawer.rectangle((max(0, x - 8), max(0, y - 8), x + w + 8, y + h + 8), outline="#16a34a", width=6)
+        drawer.rectangle(
+            [max(0, x - 6), max(0, y - 6), x + w + 6, y + h + 6],
+            outline="#16a34a",
+            width=4,
+        )
     return img
 
 
-def status_tag(value: str) -> str:
-    return {
-        "detectada": "Hora sugerida",
-        "corregida": "Corregida",
-        "revision": "Revisar hora",
-        "sin_hora": "Sin hora",
-        "duplicada": "Duplicada",
-        "error": "Error",
-    }.get(value, value)
+def export_data(rows: list[dict[str, Any]]) -> bytes:
+    frame = pd.DataFrame([{col: row.get(col, "") for col in TABLE_COLUMNS} for row in rows])
+    return frame.to_csv(index=False).encode("utf-8-sig")
 
+
+def clean_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {col: row.get(col) for col in TABLE_COLUMNS}
+
+
+# Modo nube: requiere clave privada de servidor y contraseña.
+url, service_key, admin_password = (
+    secret("SUPABASE_URL"),
+    secret("SUPABASE_SERVICE_ROLE_KEY"),
+    secret("ADMIN_PASSWORD"),
+)
+cloud_configured = bool(url and service_key)
+if cloud_configured and not admin_password:
+    st.error("Configuración incompleta: falta ADMIN_PASSWORD. Se bloqueó el acceso a datos de la nube.")
+    st.stop()
+
+if cloud_configured:
+    if not st.session_state.get("autorizado", False):
+        st.title("🔒 Acceso administrativo")
+        entered = st.text_input("Contraseña", type="password")
+        if st.button("Ingresar", type="primary"):
+            if hmac.compare_digest(entered, admin_password):
+                st.session_state.autorizado = True
+                st.rerun()
+            else:
+                st.error("Contraseña incorrecta")
+        st.stop()
+    try:
+        store = cloud_client(url, service_key)
+    except Exception as exc:
+        st.error(f"No fue posible iniciar Supabase: {type(exc).__name__}")
+        st.stop()
+else:
+    store = None
+    st.warning(
+        "Modo demostración sin nube: los resultados solo permanecerán en esta sesión. "
+        "Configura los secretos de Supabase para activar el historial permanente."
+    )
+
+if "registros_locales" not in st.session_state:
+    st.session_state.registros_locales = []
+
+# Ejecución automática de limpieza de imágenes vencidas (>60 días) una vez por sesión
+if store and not st.session_state.get("limpieza_ejecutada", False):
+    try:
+        eliminadas, _ = store.cleanup_expired_images(batch_size=50)
+        st.session_state.limpieza_ejecutada = True
+        if eliminadas > 0:
+            st.toast(f"🧹 Se eliminaron automáticamente {eliminadas} imágenes con más de 60 días.")
+    except Exception:
+        pass
 
 st.title("Analizador de capturas de WhatsApp")
-st.caption("MVP 0.4 · OCR del último mensaje visible · Control de puntualidad y catálogo territorial")
+st.caption("MVP 0.5 · Hora oficial 06:00 a. m. · 14 departamentos · Historial y retención de 60 días")
 st.info(
-    "Regla principal: la hora que se propone procede del **último mensaje visualmente** "
-    "en la captura, no de los metadatos ni de la barra superior del teléfono. "
-    "Este sistema no certifica la autenticidad de las capturas."
+    "El OCR propone la hora del **último mensaje visible**. No utiliza metadatos de imagen. "
+    "Las capturas no prueban por sí mismas la autenticidad del horario; revisa los casos dudosos."
 )
 
 with st.sidebar:
-    st.header("Configuración del lote")
-    activity_date = st.date_input("Fecha de la actividad", value=date.today())
-
-    departamento = st.selectbox("Departamento", ["Sin clasificar"] + DEPARTAMENTOS)
-    if departamento != "Sin clasificar":
-        municipios_disp = list(TERRITORIO_SV[departamento].keys())
-        municipio = st.selectbox("Municipio", ["Sin clasificar"] + municipios_disp)
-    else:
-        municipio = "Sin clasificar"
-
-    if departamento != "Sin clasificar" and municipio != "Sin clasificar":
-        distritos_disp = TERRITORIO_SV[departamento][municipio]
-        distrito = st.selectbox("Distrito", ["Sin clasificar"] + distritos_disp)
-    else:
-        distrito = "Sin clasificar"
-
+    st.header("Navegación")
+    nav_dep = st.selectbox("Departamento que deseas consultar", ["Todos"] + DEPARTAMENTOS, key="nav_dep")
+    st.caption("Cambiar de departamento NO elimina ni reinicia capturas de otros departamentos.")
     st.divider()
-    st.subheader("Métrica de puntualidad")
-    use_cutoff = st.checkbox("Evaluar hora de cumplimiento", value=True)
-    cutoff_time = st.time_input("Hora de inicio / instrucción", value=time(18, 0), disabled=not use_cutoff)
-    tolerance_min = st.number_input(
-        "Tolerancia para 'En tiempo' (minutos)",
-        min_value=0, max_value=720, value=30, step=5,
-        disabled=not use_cutoff,
+    st.subheader("Configuración de la actividad")
+    activity_date = st.date_input("Fecha de actividad", value=date.today(), key="activity_date")
+    st.text_input("Hora establecida (fija)", value="06:00 a. m.", disabled=True)
+    tolerance = st.number_input(
+        "Minutos de tolerancia para 'En tiempo'",
+        min_value=0,
+        max_value=720,
+        value=0,
+        step=1,
+        key="tolerance",
     )
-    if st.session_state.registros and st.button("Recalcular puntualidad en sesión", use_container_width=True):
-        for item in st.session_state.registros:
-            h_meta, diff_m, cump = evaluate_punctuality(
-                item["hora_final"], use_cutoff, cutoff_time, int(tolerance_min)
-            )
-            item["hora_meta"] = h_meta
-            item["diferencia_min"] = diff_m if diff_m is not None else ""
-            item["cumplimiento"] = cump
-        st.success("Métricas de puntualidad actualizadas.")
-
+    st.caption("La hora oficial no cambia. La tolerancia solamente afecta las etiquetas de cumplimiento.")
     st.divider()
-    st.caption("La selección territorial se aplica a las nuevas capturas cargadas.")
-    st.caption("Los resultados permanecen en la sesión actual; exporta el CSV antes de cerrar.")
+    st.caption("🟢 Nube activa (Supabase)" if store else "🟠 Modo sesión temporal")
+    if store and st.button("Cerrar sesión", use_container_width=True):
+        st.session_state.autorizado = False
+        st.rerun()
 
-upload_tab, results_tab, panels_tab, info_tab = st.tabs(
-    ["📤 Procesar capturas", "📋 Resultados y correcciones", "📊 Paneles", "ℹ️ Acerca del prototipo"]
-)
+
+def fetch_rows(
+    department: str = "Todos",
+    start: date | None = None,
+    end: date | None = None,
+    limit: int = 500,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    if store:
+        return store.list_records(
+            department,
+            start.isoformat() if start else None,
+            end.isoformat() if end else None,
+            limit,
+            offset,
+        )
+    rows = [
+        row
+        for row in st.session_state.registros_locales
+        if (department == "Todos" or row["departamento"] == department)
+        and (start is None or str(row["fecha_actividad"]) >= start.isoformat())
+        and (end is None or str(row["fecha_actividad"]) <= end.isoformat())
+    ]
+    return list(reversed(rows))[offset : offset + limit]
+
+
+def save_record(row: dict[str, Any], raw: bytes | None, mime: str) -> dict[str, Any]:
+    if store:
+        return store.save_record(row, raw, mime)
+    row = dict(row, id=str(uuid4()), _preview_bytes=raw)
+    st.session_state.registros_locales.append(row)
+    return row
+
+
+def save_correction(row: dict[str, Any], payload: dict[str, Any]) -> None:
+    if store:
+        store.update_record(str(row["id"]), payload)
+        return
+    for current in st.session_state.registros_locales:
+        if current["id"] == row["id"]:
+            current.update(payload)
+            return
+    raise ValueError("Registro no encontrado")
+
+
+def delete_record(row: dict[str, Any]) -> None:
+    if store:
+        store.delete_record(str(row["id"]))
+        return
+    st.session_state.registros_locales = [
+        r for r in st.session_state.registros_locales if r["id"] != row["id"]
+    ]
+
+
+def duplicates_in_date(sha: str, date_str: str) -> bool:
+    if store:
+        return store.has_original(date_str, sha)
+    return any(
+        row["fecha_actividad"] == date_str
+        and row["hash_sha256"] == sha
+        and row["estado"] != "duplicada"
+        for row in st.session_state.registros_locales
+    )
+
+
+upload_tab, result_tab, panels_tab, history_tab = st.tabs([
+    "📤 Procesar capturas",
+    "📋 Revisar resultados",
+    "📊 Paneles",
+    "🗂️ Historial",
+])
 
 with upload_tab:
-    st.subheader("Importación masiva")
+    st.subheader("Importación masiva de capturas")
+    if nav_dep == "Todos":
+        upload_dep = st.selectbox("Departamento al que se asignará este lote", DEPARTAMENTOS)
+    else:
+        upload_dep = nav_dep
+        st.success(f"El lote se clasificará en: **{upload_dep}**")
     files = st.file_uploader(
-        "Selecciona imágenes JPG, PNG o WEBP (hasta 100 por lote)",
+        "Imágenes JPG, PNG o WEBP (hasta 100 por lote)",
         type=["jpg", "jpeg", "png", "webp"],
         accept_multiple_files=True,
-        help="Sube capturas de pantalla recibidas por WhatsApp. No se conecta a WhatsApp automáticamente.",
+        key="uploader",
     )
     if files:
-        st.caption(f"{len(files)} archivo(s) seleccionados · territorio: {departamento} / {municipio} / {distrito}")
-
-    if st.button("Analizar capturas", type="primary", disabled=not files):
+        st.caption(f"{len(files)} imágenes seleccionadas · {upload_dep} · {activity_date:%d/%m/%Y}")
+    if st.button("Analizar y guardar", type="primary", disabled=not files):
         if len(files) > 100:
-            st.error("El máximo es 100 archivos por lote. Divide la carga en lotes más pequeños.")
+            st.error("Máximo 100 imágenes por lote.")
         else:
-            existing_hashes = {i["hash_corto"] for i in st.session_state.registros}
-            bar = st.progress(0, text="Iniciando OCR...")
-            added = 0
+            bar = st.progress(0.0)
+            ok, duplicate_count, failures = 0, 0, []
+            scanned: set[str] = set()
             for idx, uploaded in enumerate(files):
                 raw = uploaded.getvalue()
-                hash_hex = hashlib.sha256(raw).hexdigest()
-                smallhash = hash_hex[:16]
-                record_id = len(st.session_state.registros) + 1
-                result: dict[str, Any] = {
-                    "status": "error", "time": None, "observations": "",
-                    "selected": None, "candidates": [], "preview_bytes": raw,
+                sha = hashlib.sha256(raw).hexdigest()
+                date_str = activity_date.isoformat()
+                repeated = sha in scanned or duplicates_in_date(sha, date_str)
+                scanned.add(sha)
+                analyzed: dict[str, Any] = {
+                    "status": "error",
+                    "time": None,
+                    "observations": "",
+                    "selected": None,
+                    "preview_bytes": raw,
                 }
-                is_duplicate = smallhash in existing_hashes
-                if len(raw) > 15 * 1024 * 1024:
-                    result["observations"] = "Archivo mayor a 15 MB; no procesado."
-                elif is_duplicate:
-                    result.update(
+                if repeated:
+                    analyzed.update(
                         status="duplicada",
-                        observations="Archivo idéntico a otro ya registrado en esta sesión.",
+                        observations="Archivo idéntico a uno previamente registrado para esta fecha.",
                     )
+                    duplicate_count += 1
+                elif len(raw) > 15 * 1024 * 1024:
+                    analyzed["observations"] = "Archivo mayor a 15 MB; OCR omitido."
                 else:
                     try:
-                        result = analyze_image(raw)
+                        analyzed = analyze_image(raw)
                     except (ValueError, RuntimeError, OSError) as exc:
-                        result["observations"] = str(exc)
+                        analyzed["observations"] = str(exc)
 
-                hora_detectada = result.get("time") or ""
-                h_meta, diff_m, cump = evaluate_punctuality(
-                    hora_detectada, use_cutoff, cutoff_time, int(tolerance_min)
-                )
-
-                item = {
-                    "id": record_id,
-                    "fecha_actividad": activity_date.isoformat(),
-                    "departamento": departamento,
-                    "municipio": municipio,
-                    "distrito": distrito,
+                extracted = analyzed.get("time") or ""
+                diff, status = evaluate_punctuality(extracted, int(tolerance))
+                row = {
+                    "fecha_actividad": date_str,
+                    "departamento": upload_dep,
                     "archivo": uploaded.name,
-                    "hora_ocr": hora_detectada,
-                    "hora_final": hora_detectada,
-                    "hora_meta": h_meta,
-                    "diferencia_min": diff_m if diff_m is not None else "",
-                    "cumplimiento": cump,
-                    "estado": result.get("status", "error"),
-                    "observaciones": result.get("observations", ""),
-                    "hash_corto": smallhash,
-                    "_bytes": result.get("preview_bytes", raw),
-                    "_selected": result.get("selected"),
-                    "_candidates": result.get("candidates", []),
+                    "hash_sha256": sha,
+                    "hora_ocr": extracted or None,
+                    "hora_final": extracted or None,
+                    "hora_meta": HORA_INICIO_TEXTO,
+                    "diferencia_min": diff,
+                    "cumplimiento": status,
+                    "estado": analyzed.get("status", "error"),
+                    "observaciones": analyzed.get("observations", ""),
+                    "ocr_selected": analyzed.get("selected"),
+                    "ocr_size": analyzed.get("size"),
                 }
-                st.session_state.registros.append(item)
-                if not is_duplicate:
-                    existing_hashes.add(smallhash)
-                added += 1
-                bar.progress((idx + 1) / len(files), text=f"Procesando {idx + 1} de {len(files)}...")
-            st.success(f"Se incorporaron {added} registros a la sesión. Revisa los resultados en la siguiente pestaña.")
+                # Usamos preview_bytes (JPEG optimizado) para ahorrar espacio en Supabase durante los 60 días
+                optimized_bytes = analyzed.get("preview_bytes", raw)
+                mime = "image/jpeg" if "preview_bytes" in analyzed else (
+                    {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp"}
+                    .get(uploaded.name.rsplit(".", 1)[-1].lower(), "image/jpeg")
+                )
+                image_bytes = None if repeated or len(raw) > 15 * 1024 * 1024 else optimized_bytes
+                try:
+                    saved = save_record(row, image_bytes, mime)
+                    if not store:
+                        saved["_preview_bytes"] = optimized_bytes
+                        saved["_selected"] = analyzed.get("selected")
+                    ok += 1
+                except Exception as exc:
+                    failures.append(f"{uploaded.name}: {type(exc).__name__}: {exc}")
+                bar.progress((idx + 1) / len(files), text=f"Procesando {idx + 1}/{len(files)}")
+            st.success(f"Registros guardados: {ok} · duplicados detectados: {duplicate_count}")
+            if failures:
+                st.error(f"No se guardaron {len(failures)} archivos. No cierres esta pantalla sin revisar errores.")
+                with st.expander("Errores de almacenamiento"):
+                    for err in failures:
+                        st.write(err)
+            st.caption("Los resultados aparecen al abrir 'Revisar resultados' y 'Historial'.")
 
-with results_tab:
-    st.subheader("Resultados de la sesión (Edición rápida)")
-    if not st.session_state.registros:
-        st.warning("Todavía no hay capturas procesadas. Ve a 'Procesar capturas' para subir archivos.")
+with result_tab:
+    st.subheader("Resultados y correcciones")
+    st.caption(f"Vista: {nav_dep} · se muestran hasta 500 registros recientes del departamento seleccionado.")
+    try:
+        rows = fetch_rows(nav_dep, limit=500)
+    except Exception as exc:
+        st.error(f"No fue posible consultar resultados: {type(exc).__name__}: {exc}")
+        rows = []
+    if not rows:
+        st.info("No hay registros para este departamento. Cambia la selección en el menú lateral o sube imágenes.")
     else:
-        st.caption("💡 Puedes editar directamente la columna **Hora Final** o **Observaciones** en la tabla y presionar 'Aplicar cambios de la tabla'.")
-        frame = pd.DataFrame(table_rows(), columns=COLUMNS)
-        edit_cols = [
-            "id", "archivo", "departamento", "municipio", "distrito",
-            "hora_ocr", "hora_final", "diferencia_min", "cumplimiento", "estado", "observaciones",
-        ]
-        edited_df = st.data_editor(
-            frame[edit_cols],
-            use_container_width=True,
+        frame = pd.DataFrame([{key: row.get(key) for key in DISPLAY_COLUMNS} for row in rows])
+        editable = st.data_editor(
+            frame,
             hide_index=True,
-            disabled=["id", "archivo", "hora_ocr", "diferencia_min", "cumplimiento"],
+            use_container_width=True,
+            disabled=["id", "fecha_actividad", "archivo", "hora_ocr", "diferencia_min", "cumplimiento"],
             column_config={
-                "id": st.column_config.NumberColumn("ID", width="small"),
-                "hora_ocr": st.column_config.TextColumn("Hora OCR", width="small"),
-                "hora_final": st.column_config.TextColumn("Hora Final (HH:MM)", width="small"),
-                "diferencia_min": st.column_config.TextColumn("Dif. (min)", width="small"),
-                "cumplimiento": st.column_config.TextColumn("Cumplimiento", width="medium"),
-                "estado": st.column_config.SelectboxColumn(
-                    "Estado",
-                    options=["detectada", "corregida", "revision", "sin_hora", "duplicada", "error"],
-                    width="medium",
-                ),
+                "departamento": st.column_config.SelectboxColumn("Departamento", options=DEPARTAMENTOS, required=True),
+                "hora_final": st.column_config.TextColumn("Hora final (HH:MM)"),
+                "estado": st.column_config.SelectboxColumn("Estado", options=ESTADOS, required=True),
+                "id": st.column_config.TextColumn("ID", width="small"),
             },
-            key="main_data_editor",
+            key=f"editor_{nav_dep}_{len(rows)}",
         )
-
-        col_btn1, col_btn2, _ = st.columns([1, 1, 2])
-        with col_btn1:
-            if st.button("💾 Aplicar cambios de la tabla", type="primary", use_container_width=True):
+        c_save, c_csv = st.columns([1, 1])
+        with c_save:
+            if st.button("💾 Guardar correcciones", type="primary", use_container_width=True):
+                changes = []
                 errors = []
-                items_by_id = {i["id"]: i for i in st.session_state.registros}
-                for _, row in edited_df.iterrows():
-                    rec = items_by_id[int(row["id"])]
-                    new_h = str(row["hora_final"] or "").strip()
-                    if new_h and not is_valid_hhmm(new_h):
-                        errors.append(f"Registro #{rec['id']}: formato inválido '{new_h}' (usa HH:MM).")
+                by_id = {str(row["id"]): row for row in rows}
+                for _, item in editable.iterrows():
+                    orig = by_id[str(item["id"])]
+                    new_hour = "" if pd.isna(item["hora_final"]) else str(item["hora_final"]).strip()
+                    dep = str(item["departamento"])
+                    if new_hour and not is_valid_hhmm(new_hour):
+                        errors.append(f"{item['archivo']}: hora inválida {new_hour!r}")
                         continue
-                    if new_h != rec["hora_final"]:
-                        rec["hora_final"] = new_h
-                        rec["estado"] = "corregida"
-                    else:
-                        rec["estado"] = str(row["estado"])
-                    rec["departamento"] = str(row["departamento"])
-                    rec["municipio"] = str(row["municipio"])
-                    rec["distrito"] = str(row["distrito"])
-                    rec["observaciones"] = str(row["observaciones"])
-                    h_meta, diff_m, cump = evaluate_punctuality(
-                        rec["hora_final"], use_cutoff, cutoff_time, int(tolerance_min)
-                    )
-                    rec["hora_meta"] = h_meta
-                    rec["diferencia_min"] = diff_m if diff_m is not None else ""
-                    rec["cumplimiento"] = cump
+                    if dep not in DEPARTAMENTOS:
+                        errors.append(f"{item['archivo']}: departamento inválido")
+                        continue
+                    current_time = orig.get("hora_final") or ""
+                    state = str(item["estado"])
+                    if new_hour != current_time:
+                        state = "corregida" if new_hour else "sin_hora"
+                    diff, label = evaluate_punctuality(new_hour, int(tolerance))
+                    payload = {
+                        "departamento": dep,
+                        "hora_final": new_hour or None,
+                        "estado": state,
+                        "observaciones": "" if pd.isna(item["observaciones"]) else str(item["observaciones"]),
+                        "hora_meta": HORA_INICIO_TEXTO,
+                        "diferencia_min": diff,
+                        "cumplimiento": label,
+                    }
+                    if any(payload[k] != orig.get(k) for k in payload):
+                        changes.append((orig, payload))
                 if errors:
-                    for err in errors:
-                        st.error(err)
+                    for error in errors:
+                        st.error(error)
                 else:
-                    st.success("Cambios guardados y puntualidad recalculada.")
-                    st.rerun()
-
-        with col_btn2:
+                    saved_n = 0
+                    for orig, payload in changes:
+                        try:
+                            save_correction(orig, payload)
+                            saved_n += 1
+                        except Exception as exc:
+                            st.error(f"Error guardando {orig['archivo']}: {exc}")
+                    st.success(f"Correcciones guardadas: {saved_n}")
+                    if saved_n:
+                        st.rerun()
+        with c_csv:
             st.download_button(
-                "📥 Descargar resultados CSV",
-                export_csv(),
-                file_name=f"capturas_{activity_date.isoformat()}.csv",
-                mime="text/csv",
+                "📥 Descargar CSV visible",
+                export_data(rows),
+                "capturas_resultados.csv",
+                "text/csv",
                 use_container_width=True,
             )
 
         st.divider()
-        st.markdown("### 🔍 Inspección visual y corrección detallada")
-        solo_revision = st.checkbox(
-            "Mostrar solo registros pendientes de revisión / sin hora / error",
-            value=False,
-        )
-        items_filtrados = [
-            i for i in st.session_state.registros
-            if not solo_revision or i["estado"] in ("revision", "sin_hora", "error")
-        ]
-
-        if not items_filtrados:
-            st.success("🎉 ¡Excelente! No hay registros pendientes de revisión con este filtro.")
+        st.markdown("#### 🗑️ Duplicados detectados")
+        duplicated = [row for row in rows if row.get("estado") == "duplicada"]
+        if not duplicated:
+            st.caption("No se detectaron duplicados en los registros mostrados.")
         else:
-            options = {
-                f"#{i['id']} · {i['archivo']} · [{status_tag(i['estado'])}] · Hora: {i['hora_final'] or '---'}": i["id"]
-                for i in items_filtrados
-            }
-            picked = st.selectbox("Selecciona una captura para inspeccionar", list(options.keys()))
-            current = next(i for i in st.session_state.registros if i["id"] == options[picked])
-
-            left, right = st.columns([1, 1], gap="large")
-            with left:
-                try:
-                    st.image(
-                        annotated_preview(current["_bytes"], current["_selected"]),
-                        caption="Recuadro verde: hora sugerida por OCR",
-                        use_container_width=True,
-                    )
-                except (OSError, ValueError):
-                    st.warning("No se puede mostrar la vista previa.")
-            with right:
-                st.write(f"**Hora sugerida por OCR:** `{current['hora_ocr'] or 'No identificada'}`")
-                st.write(f"**Estado actual:** {status_tag(current['estado'])} | **Cumplimiento:** `{current['cumplimiento']}`")
-                st.write(f"**Observaciones:** {current['observaciones']}")
-                candidates = current.get("_candidates", [])
-                if candidates:
-                    st.write("**Todas las horas detectadas en la imagen (de arriba hacia abajo):**")
-                    st.code(", ".join(f"{c['source_text']} -> {c['time']}" for c in candidates))
-
-                with st.form(key=f"corregir_{current['id']}"):
-                    new_time = st.text_input("Hora final corregida (HH:MM, 24 h)", value=current["hora_final"])
-                    dep_list = ["Sin clasificar"] + DEPARTAMENTOS
-                    dep_idx = dep_list.index(current["departamento"]) if current["departamento"] in dep_list else 0
-                    new_dep = st.selectbox("Departamento del registro", dep_list, index=dep_idx)
-                    new_mun = st.text_input("Municipio del registro", value=current["municipio"])
-                    new_dis = st.text_input("Distrito del registro", value=current["distrito"])
-                    new_obs = st.text_input("Observaciones", value=current["observaciones"])
-                    submitted = st.form_submit_button("Guardar corrección individual")
-
-                if submitted:
-                    if new_time.strip() and not is_valid_hhmm(new_time.strip()):
-                        st.error("Usa formato HH:MM de 24 horas, por ejemplo 06:00 o 18:30.")
-                    else:
-                        current["hora_final"] = new_time.strip()
-                        current["departamento"] = new_dep
-                        current["municipio"] = new_mun.strip() or "Sin clasificar"
-                        current["distrito"] = new_dis.strip() or "Sin clasificar"
-                        current["observaciones"] = new_obs.strip()
-                        current["estado"] = "corregida"
-                        h_meta, diff_m, cump = evaluate_punctuality(
-                            current["hora_final"], use_cutoff, cutoff_time, int(tolerance_min)
-                        )
-                        current["hora_meta"] = h_meta
-                        current["diferencia_min"] = diff_m if diff_m is not None else ""
-                        current["cumplimiento"] = cump
-                        st.success("Corrección guardada.")
+            st.warning(f"Duplicados encontrados: {len(duplicated)}. Solo se borra el duplicado seleccionado, no el original.")
+            for dup in duplicated[:50]:
+                left, right = st.columns([4, 1])
+                left.write(f"{dup['archivo']} · {dup['departamento']} · {dup['fecha_actividad']}")
+                if right.button("Eliminar", key=f"delete_{dup['id']}", use_container_width=True):
+                    try:
+                        delete_record(dup)
+                        st.success("Duplicado eliminado")
                         st.rerun()
+                    except Exception as exc:
+                        st.error(f"No se pudo eliminar: {exc}")
+            if len(duplicated) > 50:
+                st.caption("Para mostrar otros duplicados, usa los filtros del historial.")
 
         st.divider()
-        if st.button("🗑️ Vaciar sesión", type="secondary"):
-            st.session_state.registros = []
-            st.rerun()
+        st.markdown("#### 🔍 Inspección individual")
+        options = {f"{r['archivo']} · {r['departamento']} · {str(r['id'])[:8]}": r for r in rows}
+        chosen = st.selectbox("Selecciona un registro", list(options), key=f"inspect_{nav_dep}")
+        chosen_row = options[chosen]
+        left, right = st.columns([1, 1])
+        with left:
+            try:
+                raw = store.image_bytes(chosen_row) if store else chosen_row.get("_preview_bytes")
+                if raw:
+                    sel = chosen_row.get("ocr_selected") or chosen_row.get("_selected")
+                    st.image(
+                        safe_image_preview(raw, sel, chosen_row.get("ocr_size")),
+                        use_container_width=True,
+                    )
+                else:
+                    st.info("Imagen no disponible: duplicada, no almacenada o vencida después de 60 días.")
+            except Exception as exc:
+                st.warning(f"No fue posible recuperar la imagen: {type(exc).__name__}")
+        with right:
+            st.write(f"**Hora detectada:** {chosen_row.get('hora_ocr') or 'No identificada'}")
+            st.write(f"**Hora final:** {chosen_row.get('hora_final') or 'Pendiente'}")
+            st.write(f"**Estado:** {chosen_row.get('estado')}")
+            st.write(f"**Observaciones:** {chosen_row.get('observaciones') or '—'}")
+            if chosen_row.get("imagen_expira_en"):
+                st.caption(f"La imagen original vence el {str(chosen_row['imagen_expira_en'])[:10]}; el registro permanece.")
 
 with panels_tab:
-    st.subheader("Paneles de rendimiento y cumplimiento")
-    if not st.session_state.registros:
-        st.info("Procesa algunas capturas para visualizar estadísticas reales de la sesión.")
-    else:
-        level = st.radio("Nivel de consulta", ["Nacional", "Departamental", "Municipal", "Distrital"], horizontal=True)
-        sub = pd.DataFrame(table_rows(), columns=COLUMNS)
-
-        if level in ("Departamental", "Municipal", "Distrital"):
-            departments = sorted(sub["departamento"].dropna().unique().tolist())
-            selected_dep = st.selectbox("Departamento a consultar", departments, key="panel_dep")
-            sub = sub[sub["departamento"] == selected_dep]
-        if level in ("Municipal", "Distrital"):
-            municipios = sorted(sub["municipio"].dropna().unique().tolist())
-            selected_mun = st.selectbox("Municipio a consultar", municipios, key="panel_mun")
-            sub = sub[sub["municipio"] == selected_mun]
-        if level == "Distrital":
-            district_names = sorted(sub["distrito"].dropna().unique().tolist())
-            selected_dis = st.selectbox("Distrito a consultar", district_names, key="panel_dis")
-            sub = sub[sub["distrito"] == selected_dis]
-
-        k1, k2, k3, k4, k5 = st.columns(5)
-        k1.metric("Total capturas", len(sub))
-        k2.metric("En tiempo ✅", int((sub["cumplimiento"] == "En tiempo").sum()))
-        k3.metric("Tardías ⏳", int((sub["cumplimiento"] == "Tardía").sum()))
-        k4.metric("Para revisión ⚠️", int(sub["estado"].isin(["revision", "sin_hora", "error"]).sum()))
-        k5.metric("Duplicadas 🔁", int((sub["estado"] == "duplicada").sum()))
-
-        st.markdown("#### Resumen agrupado por territorio")
-        group_col = "departamento" if level == "Nacional" else ("municipio" if level == "Departamental" else "distrito")
-        resumen = (
-            sub.groupby(group_col, dropna=False)
+    st.subheader("Indicadores por departamento")
+    st.caption("Estos cálculos corresponden a los registros cargados en la vista (máximo 500).")
+    try:
+        panel_rows = fetch_rows(nav_dep, limit=500)
+    except Exception as exc:
+        st.error(f"No se pudieron consultar indicadores: {exc}")
+        panel_rows = []
+    if panel_rows:
+        df = pd.DataFrame(panel_rows)
+        accepted = df[~df["estado"].isin(["duplicada", "error", "sin_hora", "revision"])]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Registros visibles", len(df))
+        c2.metric("En tiempo (verificados)", int((accepted["cumplimiento"] == "En tiempo").sum()))
+        c3.metric("Pendientes de revisión", int(df["estado"].isin(["revision", "sin_hora", "error"]).sum()))
+        c4.metric("Duplicados", int((df["estado"] == "duplicada").sum()))
+        summary = (
+            df.groupby("departamento", dropna=False)
             .agg(
-                Total=("id", "count"),
-                En_Tiempo=("cumplimiento", lambda s: (s == "En tiempo").sum()),
-                Tardias=("cumplimiento", lambda s: (s == "Tardía").sum()),
-                Pendientes_Revision=("estado", lambda s: s.isin(["revision", "sin_hora", "error"]).sum()),
+                Capturas=("id", "count"),
+                En_tiempo=("cumplimiento", lambda s: int((s == "En tiempo").sum())),
+                Duplicadas=("estado", lambda s: int((s == "duplicada").sum())),
             )
             .reset_index()
         )
-        resumen["% Efectividad a tiempo"] = (
-            (resumen["En_Tiempo"] / resumen["Total"].replace(0, 1)) * 100
-        ).round(1).astype(str) + "%"
-        st.dataframe(resumen, use_container_width=True, hide_index=True)
+        st.dataframe(summary, use_container_width=True, hide_index=True)
+    else:
+        st.info("No hay datos para mostrar.")
 
-        st.markdown("#### Detalle de registros filtrados")
-        st.dataframe(
-            sub[["id", "fecha_actividad", "departamento", "municipio", "distrito", "archivo", "hora_final", "diferencia_min", "cumplimiento", "estado"]],
-            use_container_width=True,
-            hide_index=True,
+with history_tab:
+    st.subheader("Historial de capturas")
+    st.caption("Los registros se conservan en la base de datos. Las imágenes originales se eliminan después de 60 días.")
+    f1, f2 = st.columns(2)
+    default_start = date.today() - timedelta(days=30)
+    with f1:
+        start = st.date_input("Desde", value=default_start, key="hist_start")
+    with f2:
+        end = st.date_input("Hasta", value=date.today(), key="hist_end")
+    if start > end:
+        st.error("La fecha inicial no puede ser mayor que la final.")
+    else:
+        page = st.number_input(
+            "Página de resultados (500 registros por página)",
+            min_value=1,
+            value=1,
+            step=1,
+            key="hist_page",
         )
+        try:
+            history = fetch_rows(nav_dep, start, end, 500, (int(page) - 1) * 500)
+            if not history:
+                st.info("No hay registros en el período y departamento seleccionados.")
+            else:
+                st.dataframe(
+                    pd.DataFrame([clean_row(row) for row in history]),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                st.download_button(
+                    "📥 Exportar página actual (CSV)",
+                    export_data(history),
+                    file_name=f"historial_{start}_{end}_pag{page}.csv",
+                    mime="text/csv",
+                )
+                if len(history) == 500:
+                    st.caption("Puede haber más registros. Aumenta el número de página para consultarlos.")
+        except Exception as exc:
+            st.error(f"No se pudo abrir el historial: {exc}")
 
-with info_tab:
-    st.markdown("""
-    ### Alcance de la versión MVP 0.4
-    - **Catálogo Territorial Completo:** 14 departamentos, 44 municipios y 262 distritos de El Salvador estandarizados.
-    - **Preprocesamiento Inteligente:** Soporte mejorado para capturas en Modo Oscuro y compresión en memoria para evitar caídas del servidor.
-    - **Métrica de Puntualidad:** Cálculo automático de minutos de retraso y clasificación (*En tiempo*, *Tardía*, *Antes de inicio*).
-    - **Edición en Tabla:** Corrección masiva directamente en la tabla de resultados sin ir registro por registro.
-    """)
+st.divider()
+st.caption("Historial en nube activo con Supabase · Retención automática de imágenes por 60 días.")
