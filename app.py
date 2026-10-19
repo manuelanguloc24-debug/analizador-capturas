@@ -192,8 +192,8 @@ div[data-testid="stMetric"] {background: var(--secondary-background-color); padd
 </style>
 """, unsafe_allow_html=True)
 
-if "items" not in st.session_state:
-    st.session_state.items = []
+if "registros" not in st.session_state:
+    st.session_state.registros = []
 
 
 def is_valid_hhmm(val: str) -> bool:
@@ -206,7 +206,6 @@ def evaluate_punctuality(
     cutoff_time: time,
     tolerance_min: int,
 ) -> tuple[str, int | None, str]:
-    """Calcula diferencia en minutos y estado de cumplimiento respecto a la hora meta."""
     if not use_cutoff:
         return "", None, "No aplica"
     meta_str = cutoff_time.strftime("%H:%M")
@@ -224,7 +223,7 @@ def evaluate_punctuality(
 
 
 def table_rows() -> list[dict[str, Any]]:
-    return [{k: item.get(k, "") for k in COLUMNS} for item in st.session_state.items]
+    return [{k: item.get(k, "") for k in COLUMNS} for item in st.session_state.registros]
 
 
 def export_csv() -> bytes:
@@ -245,11 +244,11 @@ def annotated_preview(data: bytes, selected: dict[str, Any] | None) -> Image.Ima
 def status_tag(value: str) -> str:
     return {
         "detectada": "Hora sugerida",
+        "corregida": "Corregida",
         "revision": "Revisar hora",
         "sin_hora": "Sin hora",
-        "error": "Error",
         "duplicada": "Duplicada",
-        "corregida": "Corregida",
+        "error": "Error",
     }.get(value, value)
 
 
@@ -287,8 +286,8 @@ with st.sidebar:
         min_value=0, max_value=720, value=30, step=5,
         disabled=not use_cutoff,
     )
-    if st.session_state.items and st.button("Recalcular puntualidad en sesión", use_container_width=True):
-        for item in st.session_state.items:
+    if st.session_state.registros and st.button("Recalcular puntualidad en sesión", use_container_width=True):
+        for item in st.session_state.registros:
             h_meta, diff_m, cump = evaluate_punctuality(
                 item["hora_final"], use_cutoff, cutoff_time, int(tolerance_min)
             )
@@ -320,14 +319,14 @@ with upload_tab:
         if len(files) > 100:
             st.error("El máximo es 100 archivos por lote. Divide la carga en lotes más pequeños.")
         else:
-            existing_hashes = {i["hash_corto"] for i in st.session_state.items}
+            existing_hashes = {i["hash_corto"] for i in st.session_state.registros}
             bar = st.progress(0, text="Iniciando OCR...")
             added = 0
             for idx, uploaded in enumerate(files):
                 raw = uploaded.getvalue()
                 hash_hex = hashlib.sha256(raw).hexdigest()
                 smallhash = hash_hex[:16]
-                record_id = len(st.session_state.items) + 1
+                record_id = len(st.session_state.registros) + 1
                 result: dict[str, Any] = {
                     "status": "error", "time": None, "observations": "",
                     "selected": None, "candidates": [], "preview_bytes": raw,
@@ -370,7 +369,7 @@ with upload_tab:
                     "_selected": result.get("selected"),
                     "_candidates": result.get("candidates", []),
                 }
-                st.session_state.items.append(item)
+                st.session_state.registros.append(item)
                 if not is_duplicate:
                     existing_hashes.add(smallhash)
                 added += 1
@@ -379,7 +378,7 @@ with upload_tab:
 
 with results_tab:
     st.subheader("Resultados de la sesión (Edición rápida)")
-    if not st.session_state.items:
+    if not st.session_state.registros:
         st.warning("Todavía no hay capturas procesadas. Ve a 'Procesar capturas' para subir archivos.")
     else:
         st.caption("💡 Puedes editar directamente la columna **Hora Final** o **Observaciones** en la tabla y presionar 'Aplicar cambios de la tabla'.")
@@ -412,7 +411,7 @@ with results_tab:
         with col_btn1:
             if st.button("💾 Aplicar cambios de la tabla", type="primary", use_container_width=True):
                 errors = []
-                items_by_id = {i["id"]: i for i in st.session_state.items}
+                items_by_id = {i["id"]: i for i in st.session_state.registros}
                 for _, row in edited_df.iterrows():
                     rec = items_by_id[int(row["id"])]
                     new_h = str(row["hora_final"] or "").strip()
@@ -457,7 +456,7 @@ with results_tab:
             value=False,
         )
         items_filtrados = [
-            i for i in st.session_state.items
+            i for i in st.session_state.registros
             if not solo_revision or i["estado"] in ("revision", "sin_hora", "error")
         ]
 
@@ -469,7 +468,7 @@ with results_tab:
                 for i in items_filtrados
             }
             picked = st.selectbox("Selecciona una captura para inspeccionar", list(options.keys()))
-            current = next(i for i in st.session_state.items if i["id"] == options[picked])
+            current = next(i for i in st.session_state.registros if i["id"] == options[picked])
 
             left, right = st.columns([1, 1], gap="large")
             with left:
@@ -521,12 +520,12 @@ with results_tab:
 
         st.divider()
         if st.button("🗑️ Vaciar sesión", type="secondary"):
-            st.session_state.items = []
+            st.session_state.registros = []
             st.rerun()
 
 with panels_tab:
     st.subheader("Paneles de rendimiento y cumplimiento")
-    if not st.session_state.items:
+    if not st.session_state.registros:
         st.info("Procesa algunas capturas para visualizar estadísticas reales de la sesión.")
     else:
         level = st.radio("Nivel de consulta", ["Nacional", "Departamental", "Municipal", "Distrital"], horizontal=True)
